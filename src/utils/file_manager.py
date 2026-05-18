@@ -80,3 +80,22 @@ class ManageFiles:
     def write(self, content: str):
         with open(self.file, "w", encoding="utf-8") as f:
             f.write(content)
+
+class ScrapeFiles:
+    def __init__(self, usage: str = "general"):
+        self.usage = usage
+        self.file = BASE_DIR / "data" / f"{usage}.md"
+
+    def _file_exists(self):
+        return self.file.exists()
+
+    def read(self):
+        if not self._file_exists():
+            return "Error: File '{self.usage}' does not exist."
+
+        with open(self.file, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def write(self, content: str):
+        with open(self.file, "w", encoding="utf-8") as f:
+            f.write(content)
