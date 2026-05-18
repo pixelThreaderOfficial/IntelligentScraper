@@ -68,7 +68,7 @@ class IntelligentScrapeOrchestrator:
         self.topic: str = ""
         self.target_mb: float = 0.0
         self.session_folder: Optional[Path] = None
-        self.scraped_websites: set[str] = set()  # dedup guard for this session
+        self.scraped_urls: set[str] = set()  # URL-level dedup guard for this session
         self.memory_points: list[str] = []
 
     # ------------------------------------------------------------------
@@ -136,7 +136,7 @@ class IntelligentScrapeOrchestrator:
         """
         self.topic = topic
         self.target_mb = target_mb
-        self.scraped_websites = set()
+        self.scraped_urls = set()
 
         await self.scheduler.start()
 
@@ -184,13 +184,20 @@ class IntelligentScrapeOrchestrator:
             self.logger.error(LOG_ID, LOC, f"Unhandled error in session: {exc}")
 
         finally:
+            # Compact memory before shutdown (in main event loop, not in worker thread)
+            await self._async_compact_memory_if_needed()
+
             final_mb = self.calculate_session_size_mb()
+            # Count unique domains from scraped URLs
+            unique_domains = len(
+                set(self.extract_website(url) for url in self.scraped_urls)
+            )
             self.logger.info(
                 LOG_ID,
                 LOC,
                 f"Session {self.session_id} complete | "
                 f"corpus={final_mb:.2f} MB | "
-                f"unique_sites={len(self.scraped_websites)}",
+                f"unique_urls={len(self.scraped_urls)} | unique_sites={unique_domains}",
             )
             await self.scheduler.shutdown()
 
@@ -213,29 +220,23 @@ class IntelligentScrapeOrchestrator:
         )
 
     async def append_memory_point(self, point: str) -> None:
-        """Add a bullet point to memory then schedule a compaction check."""
+        """Add a bullet point to memory."""
         self.memory_points.append(point)
         # Persist immediately (cheap write)
         self._flush_memory()
-        # Compaction is non-critical – offload to scheduler
-        await self.scheduler.schedule(
-            self._bg_compact_memory_if_needed,
-            params={},
-        )
+        # NOTE: Memory compaction now happens only at session end, in main event loop
 
     def _flush_memory(self) -> None:
         """Write current memory_points list back to memory.md."""
         content = "\n".join(f"- {p}" for p in self.memory_points)
         self.memory_manager.write(content)
 
-    def _bg_compact_memory_if_needed(self) -> None:
+    async def _async_compact_memory_if_needed(self) -> None:
         """
-        Background task: if memory exceeds MAX_MEMORY_POINTS, ask the LLM to
-        compress it (MEMORY response_type) without information loss.
+        Async task: if memory exceeds MAX_MEMORY_POINTS, compact it via LLM.
 
-        Runs inside a Scheduler worker thread (sync context). Since OllamaWorker
-        uses AsyncClient, we spin up a fresh event loop for this one call so the
-        worker thread stays non-blocking relative to the main loop.
+        This runs in the main event loop ONLY (not in background workers) to avoid
+        event loop closure issues that corrupt the Ollama client state.
         """
         if len(self.memory_points) <= MAX_MEMORY_POINTS:
             return
@@ -260,9 +261,9 @@ class IntelligentScrapeOrchestrator:
                 },
             ]
 
-            # Run async LLM call in a dedicated event loop for this worker thread
-            agent_response = asyncio.run(
-                self.llm.generate_response(messages, response_type="MEMORY")
+            # Run async LLM call in the main event loop (no asyncio.run()!)
+            agent_response = await self.llm.generate_response(
+                messages, response_type="MEMORY"
             )
 
             if not agent_response.success or not agent_response.data:
@@ -522,18 +523,20 @@ class IntelligentScrapeOrchestrator:
         if not source_url or not content:
             return
 
-        website_host = self.extract_website(source_url)
-        if website_host in self.scraped_websites:
-            self.logger.info(LOG_ID, LOC, f"Skipping duplicate website: {website_host}")
+        # URL-level deduplication: skip if this exact URL was already scraped
+        if source_url in self.scraped_urls:
+            self.logger.info(LOG_ID, LOC, f"Skipping duplicate URL: {source_url}")
             return
 
         # --- Write markdown file (blocking – size needs to be recalculated after) ---
-        md_path = self.save_page_markdown(title or website_host, content, source_url)
+        md_path = self.save_page_markdown(
+            title or self.extract_website(source_url), content, source_url
+        )
         if not md_path:
             return
 
-        # Mark website as seen immediately in-memory
-        self.scraped_websites.add(website_host)
+        # Mark URL as seen immediately in-memory
+        self.scraped_urls.add(source_url)
 
         scrape_datetime = get_time().isoformat()
 
@@ -560,12 +563,15 @@ class IntelligentScrapeOrchestrator:
             },
         )
 
-        # 3. Update session total_websites count
+        # 3. Update session total_websites count (count unique domains from scraped URLs)
+        unique_domains = len(
+            set(self.extract_website(url) for url in self.scraped_urls)
+        )
         await self.scheduler.schedule(
             self._bg_update_session_total,
             params={
                 "session_id": self.session_id,
-                "total": len(self.scraped_websites),
+                "total": unique_domains,
             },
         )
 
