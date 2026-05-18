@@ -12,6 +12,8 @@ wheels/
 # custom
 temp
 temp/*
+data
+data/*
 
 # environment vars
 .env

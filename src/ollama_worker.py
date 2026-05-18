@@ -197,7 +197,7 @@ class OllamaWorker:
             )
 
             raw_content = (
-                response.message.content if response and response.message else ""
+                response.message.content or "" if response and response.message else ""
             )
             logger.info(
                 "Received raw chat response | task=%s content_length=%s",

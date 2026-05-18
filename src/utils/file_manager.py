@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Callable
 import logging
 
 BASE_DIR = Path(__file__).parent.parent.parent
@@ -72,7 +73,7 @@ class ManageFiles:
 
     def read(self):
         if not self._file_exists():
-            return "Error: File '{self.usage}' does not exist."
+            return f"Error: File '{self.usage}' does not exist."
 
         with open(self.file, "r", encoding="utf-8") as f:
             return f.read()
@@ -81,21 +82,72 @@ class ManageFiles:
         with open(self.file, "w", encoding="utf-8") as f:
             f.write(content)
 
-class ScrapeFiles:
-    def __init__(self, usage: str = "general"):
-        self.usage = usage
-        self.file = BASE_DIR / "data" / f"{usage}.md"
 
-    def _file_exists(self):
-        return self.file.exists()
+# ---------------------------------------------------------------------------
+# SessionFileManager – generic path-based file operations
+# ---------------------------------------------------------------------------
+class SessionFileManager:
+    """
+    Centralises all filesystem manipulation for the scraping pipeline.
 
-    def read(self):
-        if not self._file_exists():
-            return "Error: File '{self.usage}' does not exist."
+    All methods are sync (the orchestrator calls them in its sync context).
+    Parent directories are created automatically before writes.
+    Errors are raised explicitly – callers decide how to handle them.
+    """
 
-        with open(self.file, "r", encoding="utf-8") as f:
-            return f.read()
+    @staticmethod
+    def ensure_dir(path: Path) -> None:
+        """Create *path* (and parents) if it does not already exist."""
+        path.mkdir(parents=True, exist_ok=True)
 
-    def write(self, content: str):
-        with open(self.file, "w", encoding="utf-8") as f:
-            f.write(content)
+    @staticmethod
+    def write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+        """Write *content* to *path*, creating parent directories first."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding=encoding)
+
+    @staticmethod
+    def read_text(path: Path, encoding: str = "utf-8") -> str:
+        """Read and return the full text content of *path*."""
+        return path.read_text(encoding=encoding)
+
+    @staticmethod
+    def write_scraped_markdown(
+        session_folder: Path,
+        title_or_host: str,
+        source_url: str,
+        content: str,
+        timestamp: str,
+        slugify_fn: Callable[[str], str],
+    ) -> Path:
+        """
+        Build a timestamped markdown file in *session_folder* and write it.
+
+        Returns the Path of the written file.
+
+        Filename pattern: ``<slug>_<timestamp>.md``
+
+        Markdown shape::
+
+            # <title_or_host>
+
+            **Source:** <source_url>
+
+            ---
+
+            <content>
+        """
+        slug = slugify_fn(title_or_host)
+        filename = f"{slug}_{timestamp}.md"
+        file_path = session_folder / filename
+
+        md_content = (
+            f"# {title_or_host}\n\n"
+            f"**Source:** {source_url}\n\n"
+            f"---\n\n{content}"
+        )
+
+        # Ensure session folder exists (idempotent)
+        session_folder.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(md_content, encoding="utf-8")
+        return file_path
