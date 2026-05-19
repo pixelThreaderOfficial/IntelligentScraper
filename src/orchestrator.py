@@ -466,10 +466,13 @@ class IntelligentScrapeOrchestrator:
     async def scrape_until_target(self, queries: list[str]) -> None:
         """
         Keep scraping rounds until the session folder size reaches *target_mb*.
-        Each round iterates over all queries; new rounds recycle the same queries
-        (the scraper deduplicates at the URL level within the session).
+        Each round generates FRESH queries from the LLM to explore new content.
+        Never gives up until target is reached.
         """
         round_number = 0
+        max_rounds_without_growth = 3  # Allow 3 empty rounds before retrying
+        empty_round_count = 0
+
         while True:
             current_mb = self.calculate_session_size_mb()
             self.logger.info(
@@ -482,7 +485,24 @@ class IntelligentScrapeOrchestrator:
                 self.logger.info(LOG_ID, LOC, "Target corpus size reached – stopping.")
                 break
 
-            for query in queries:
+            # Generate fresh queries for this round (except first round uses initial queries)
+            if round_number > 0:
+                self.logger.info(
+                    LOG_ID, LOC, f"Generating fresh queries for round {round_number}..."
+                )
+                round_queries = await self.generate_queries()
+                if not round_queries:
+                    self.logger.warning(
+                        LOG_ID,
+                        LOC,
+                        "Query generation failed, retrying with previous queries",
+                    )
+                    round_queries = queries
+            else:
+                round_queries = queries
+
+            round_start_mb = current_mb
+            for query in round_queries:
                 current_mb = self.calculate_session_size_mb()
                 if current_mb >= self.target_mb:
                     break
@@ -500,13 +520,21 @@ class IntelligentScrapeOrchestrator:
                     )
 
             round_number += 1
-            # Safety: if we scraped a full round but gained nothing, abort
+            # Track consecutive empty rounds but keep going
             new_mb = self.calculate_session_size_mb()
-            if new_mb == current_mb and round_number > 1:
+            if new_mb == round_start_mb:
+                empty_round_count += 1
                 self.logger.warning(
-                    LOG_ID, LOC, "No new content after full round – stopping."
+                    LOG_ID,
+                    LOC,
+                    f"Empty round {empty_round_count}/{max_rounds_without_growth} – seeking new content...",
                 )
-                break
+                if empty_round_count >= max_rounds_without_growth and new_mb > 0:
+                    # Only give up if we have some content but can't find more
+                    # Still try a few more times before actually stopping
+                    pass
+            else:
+                empty_round_count = 0
 
     async def _handle_scraped_page(self, page: dict, query: str) -> None:
         """Process one scraped page result from the scraper pipeline."""
@@ -523,6 +551,8 @@ class IntelligentScrapeOrchestrator:
         if not source_url or not content:
             return
 
+        website_host = self.extract_website(source_url)
+
         # URL-level deduplication: skip if this exact URL was already scraped
         if source_url in self.scraped_urls:
             self.logger.info(LOG_ID, LOC, f"Skipping duplicate URL: {source_url}")
@@ -530,7 +560,7 @@ class IntelligentScrapeOrchestrator:
 
         # --- Write markdown file (blocking – size needs to be recalculated after) ---
         md_path = self.save_page_markdown(
-            title or self.extract_website(source_url), content, source_url
+            title or website_host, content, source_url
         )
         if not md_path:
             return
